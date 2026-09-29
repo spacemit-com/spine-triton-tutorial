@@ -199,11 +199,11 @@ backward 要算三个量：dx（同形状）、dw/db（各 (N,)，**跨所有行
 一个算子里出现两种正交的归约方向，这是 norm 类 backward 的通用结构
 （GroupNorm/InstanceNorm 同理，只是多一个分组维度）。
 
-> 已知平台问题：conv/norm 家族 backward 的“内层循环 iter_arg = 外层
-> iter_arg”跨层携带累加器结构，会撞 spine-mlir bufferization 的 RaW 冲突
-> （`SCFLoopBufferizationPreprocessing` 无条件 materialize，已定位、移交
-> 修复中）。碰到 `'scf.for' op not bufferizable: cannot avoid RaW conflict`
-> 不是你的 kernel 写错了。
+> 已知编译器问题：conv/norm 家族 backward 的“内层循环 iter_arg = 外层
+> iter_arg”跨层携带累加器结构，在 bufferization（tensor→内存缓冲）阶段
+> 会触发读写冲突报错。碰到 `'scf.for' op not bufferizable: cannot avoid
+> RaW conflict` **不是你的 kernel 写错了**，是编译器对该结构的已知限制
+> （已定位）；能绕则把跨层累加改写为单层循环内完成，或关注新版 wheel。
 
 ## 2.6 K3 端口层四连坑（全部实战修过）
 
@@ -260,8 +260,8 @@ python3 -m pytest python/tests/raw/test_raw_layernorm.py -q  # raw 版
 示例文件里对照被注释掉就是这个原因）；fp16 结果 atol/rtol 1e-2 量级、
 fp32 用 1e-4~1e-5。
 
-引用历史测试数字时注意批次 runtime 版本：旧批次的 fp32/backward“数值
-失败”可能是 libspert 0.6.0 grid 丢弃假象（basics/04 §4.7）。
+引用历史测试数字时注意批次的 wheel 版本：旧批次的 fp32/backward“数值
+失败”可能是旧版运行时丢弃超大 grid 的假象（basics/04 §4.7）。
 
 ## 2.9 练习
 

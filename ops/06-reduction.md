@@ -135,9 +135,9 @@ python reduction.py
   100 万个元素误差会大到肉眼可见。上面 1M 求和的容差特意放到
   atol=1e-1——即便 f32 累加，百万级顺序求和的舍入也在 1e-2~1e-1 量级
   （容差要按**归约长度**缩放，不是按输出元素数，见 6.6）。
-- **grid=977**：旧 libspert（<0.6.3）会把超过 512 的 grid 静默丢弃，
-  partial 里出现未初始化垃圾（basics/04 §4.5）。0.6.3+ 无碍；如果你的
-  环境是旧 runtime，把 BLOCK 调到 2048（grid=489）即可绕过。
+- **grid=977**：旧版 wheel 会把超大 grid 静默丢弃，partial 里出现未初始
+  化垃圾（basics/04 §4.5）。新版运行时自动分块，无碍；如果你的 wheel
+  较旧，把 BLOCK 调到 2048（grid=489）即可绕过。
 - **段2 用 torch 不丢人**：partial 只有 977 个数，torch.sum 微秒级。
   写单 program 收尾 kernel 或 atomic 都只在“launch 开销被证明是瓶颈”后
   才值得。
@@ -181,21 +181,21 @@ mean/var/rms 链见 ops/03 §3.5；argmax 见 `test_raw_argmax.py`。
 
 K3 的向量是 scalable 的（f32/i32 一个寄存器 32 元素、f16 64 元素，
 vlen=1024）。**归约维长度（或 BLOCK）与寄存器宽度的三种边界关系，历史上
-都出过 spine-opt 级 bug**——都已修复或移交，但症状要认识，否则会把平台
-问题当成自己 kernel 写错：
+都出过编译器级 bug**——新版大多已修复，但症状要认识，否则会把工具链问题
+当成自己 kernel 写错：
 
-| 边界 | 症状（旧二进制） | 状态 |
+| 边界 | 症状（旧版 wheel） | 状态 |
 |---|---|---|
-| BLOCK < 寄存器宽（如 BLOCK=16 的 int32） | in_bounds 误推断 → poison init → vredsum 折叠垃圾 lane：`tl.sum` 恒差 -16、f32 出 NaN | 已修（spine-mlir `d04296f`：load 强制 broadcast padding） |
-| 行长 % vscale != 0（如 cumsum(1,2)） | `ConvertToScalableVector.cc:55 totalNumel % vscale == 0` SIGABRT | 移交（scan 族，见 ops/09） |
-| 行长 == vscale（len 15/16） | `ConvertVectorToSCFPass.cc:962 rank==1` SIGABRT | 已修（`c63415b`：scalable 单位维不许 dropDim） |
+| BLOCK < 寄存器宽（如 BLOCK=16 的 int32） | 边界误判把越界垃圾 lane 折叠进归约：`tl.sum` 恒差 -16、f32 出 NaN | 新版已修复 |
+| 行长不是寄存器宽整倍数（如 cumsum 的某些 2D shape） | 编译器断言崩溃（rc=134、无 Python 栈） | 旧版限制（scan 族，见 ops/09） |
+| 行长恰好等于寄存器宽（len 15/16） | 编译器断言崩溃（rc=134） | 新版已修复 |
 
 两个配套纪律：
 
 - **cache 会掩盖这类编译 bug**：崩溃/错值 shape“一直复现”可能只是缓存
   .so 命中。先 `mv` 换 TRITON_CACHE_DIR 再下结论（basics/04 §4.2）。
-- **rc=134 且无 Python 栈 = 编译器层**，拿缓存里的 `.linalgdir` 离线喂
-  spine-opt 复现（basics/04 §4.4），不要在 kernel 源码里瞎改。
+- **rc=134 且无 Python 栈 = 编译器层**：不要在 kernel 源码里瞎改，按
+  basics/04 §4.4 的流程走（新 cache → 最小化 → 升级 wheel → 报告）。
 
 其余通用约束：f16 大归约必须 f32 累加（顺序累加误差实测可达 rel 0.6%
 ——vector_norm 24F 的教训）；归约展开的中间 buffer 同样吃 TCM 256KB
@@ -251,8 +251,8 @@ x = buf[:numel].view(shape)          # 保持精确 stride/specialization
 ```
 
 任何越界读都会把 NaN 带进输出，逐块扫描即可定位 OOB 区间。归约 kernel
-的“某 shape 区间数据依赖错值”（如负 vl OOB 的 K∈(64,96) 家族）用这招
-一次定位。
+的“某 shape 区间数据依赖错值”（如旧版编译器只在特定 K 区间触发的越界读
+bug）用这招一次定位。
 
 ## 6.9 练习
 
@@ -266,6 +266,6 @@ x = buf[:numel].view(shape)          # 保持精确 stride/specialization
    段2 用 torch 做 `partial_max.argmax()` 再还原全局下标）。
 5. 思考题：形态 B 里 BLOCK=1024 → grid=977。如果把 BLOCK 改成 64，
    grid=15625，段2 的 torch.sum 输入变 15625 个数——两头开销怎么变？
-   在 QEMU 上实测 partial_sum 两种 BLOCK 的墙钟（记得各自独立 cache）。
+   在 K3 上实测 partial_sum 两种 BLOCK 的墙钟（记得各自独立 cache）。
 
 下一篇：[07-elementwise-fused.md](07-elementwise-fused.md) —— 逐元素与融合。

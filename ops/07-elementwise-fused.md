@@ -99,8 +99,9 @@ python swiglu.py
   喂 = CompilationError。这个检查是 K3 逐元素算子的第一大坑（7.4）。
 - **一维扁平化**：`N = g.numel()`，不关心原始 shape——逐元素算子对
   layout 无感知，扁平处理最简单也最快（连续访存）。
-- **grid = cdiv(3M, 1024) = 3072**：0.6.3+ runtime 无压力；旧 runtime
-  环境把 BLOCK 调大或加 kernel 内循环（7.5 的 pointwise_dynamic 模式）。
+- **grid = cdiv(3M, 1024) = 3072**：新版运行时无压力；旧版 wheel 对超大
+  grid 有上限，超限会静默出错（basics/04 §4.5）——升级 wheel，或把 BLOCK
+  调大 / 加 kernel 内循环（7.5 的 pointwise_dynamic 模式）。
 
 ## 7.3 epilogue 融合：逐元素链挂到 GEMM 尾巴上
 
@@ -137,16 +138,16 @@ sigmoid 贵几个数量级。**“中间结果不落内存”是融合的全部�
 tl.sigmoid/tanh/... ─► triton/language/math.py（_check_dtype: 只收 fp32/fp64）
 libdevice.acos/...  ─► language/cpu/libdevice.py（@core.extern → extern_elementwise
                        → {(dtype,): ("math.X", dtype)} 映射到 MLIR math dialect）
-                       ─► spine-triton-opt ConvertExternSpecialMath 白名单
-                       ─► spine-opt e2e（math → LLVM）─► llc
+                       ─► 编译器白名单（哪些 math 函数被支持）
+                       ─► 后端降级（math → LLVM）→ 代码生成
 ```
 
 | 症状 | 层 | 根因与处置 |
 |---|---|---|
-| `Expected dtype ['fp32','fp64'] but got fp16` | 前端 | `_check_dtype`，故意设计；kernel 里先 `.to(tl.float32)`。**别想着改 math.py 全局提升**（上游 FlagGems 两次修复 PR #2985/#3001 都被 revert；本地也曾否决该方案——影响面不可控） |
+| `Expected dtype ['fp32','fp64'] but got fp16` | 前端 | `_check_dtype`，故意设计；kernel 里先 `.to(tl.float32)`。**别想着改 math.py 全局提升**（上游 FlagGems 曾两次尝试修复又都 revert——影响面不可控） |
 | `'constexpr_type' object has no attribute 'scalar'` | 前端 | JIT 内字面量 `pow(x, 2)` 的 `2` 是 constexpr；直调类型提升函数前须 `isinstance(x, core.constexpr)` 解包 `.value`（gelu_backward 24 例编译崩的根因） |
-| `Dialect 'math' not found`（mlir-translate） | spine-opt | math op 没被 e2e lower。可 lower 清单：acos/asin/atan/cos/sin/tan/cosh/sinh/tanh/exp2/expm1/log2/log10/log1p/cttz；**acosh/asinh/atanh/cbrt 残留不 lower**（当前无算子用到；新 kernel 避开或先确认） |
-| 新 libdevice 函数“不存在” | shim/C++ 白名单 | cpu shim 必须是 `extern_elementwise` 形态（历史上 15 个 shim 调不存在的 `_semantic.create_X`，已修）；C++ 侧 `isUnaryMathSymbol` 白名单须同步扩（`linalg.rint`→`math::RoundEvenOp` 就是这么修的；rint=round-half-to-**even**，不能映射 math.round） |
+| `Dialect 'math' not found` | 编译器后端 | math op 没被降级到底。可 lower 清单：acos/asin/atan/cos/sin/tan/cosh/sinh/tanh/exp2/expm1/log2/log10/log1p/cttz；**acosh/asinh/atanh/cbrt 残留不 lower**（当前无算子用到；新 kernel 避开或先确认） |
+| 新 libdevice 函数“不存在” | 前端 shim / 后端白名单 | cpu shim 必须是 `extern_elementwise` 形态（历史上 15 个 shim 调不存在的函数，已修）；后端白名单须同步扩（`linalg.rint`→`math::RoundEvenOp` 就是这么修的；rint=round-half-to-**even**，不能映射 math.round） |
 | `ffs` 语义不对 | shim | CUDA 语义 1-based、0 返回 0，用 `math.cttz`+select 实现；op 注册名是 `math.cttz/ctlz`，**没有 "math.ctz"** |
 
 审计方法（接手一批逐元素算子时）：全量 grep `tl.exp|tl.log|tl.sqrt|
@@ -157,14 +158,14 @@ libdevice.` 调用点，确认每处都有前置 cast / f32 标量提升 / COMPU
 
 FlagGems 里大部分二元逐元素算子走 **pointwise_dynamic** codegen：
 `num_ctas = min(max_grid, num_tiles)` + kernel 内循环处理多 tile——
-**天然 grid-safe**（grid 永远不超上限，不受旧 runtime ≤512 限制）。
+**天然 grid-safe**（grid 永远不超上限，不受旧版 wheel 的 grid 限制影响）。
 但注意它的 **in-place / out 变体走的是手写平坦 kernel**，不享受该保护——
 历史上 le/maximum/where/clamp 的 in-place 变体失败而 out-of-place 通过
 就是这个差别。自己写逐元素 kernel 时，两种保证 grid 安全的方式：
 
 1. host 算 grid 时封顶 + kernel 内 `for` 循环吃掉剩余（pointwise_dynamic
    模式）；
-2. 确认目标环境 libspert ≥0.6.3（引擎自动分块），直接放开 grid。
+2. 确认 wheel 版本较新（运行时会对超大 grid 自动分块），直接放开 grid。
 
 ## 7.6 spine_raw 逐元素
 

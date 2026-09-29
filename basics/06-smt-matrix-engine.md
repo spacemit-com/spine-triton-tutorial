@@ -15,7 +15,7 @@ K3 上有两种算力：
   次 f16 乘加——是单条向量指令的两个数量级。
 
 对 GEMM（`C = A @ B`）这种计算密度高的算子，走不走矩阵引擎的差距是
-**几倍到几十倍**。实测参照（Qwen3-0.6B prefill，规则见 CLAUDE.md 72/75）：
+**几倍到几十倍**。实测参照（Qwen3-0.6B prefill，K3 真机）：
 proj mm 五个 shape 合计，矩阵引擎路径 3.51ms vs 纯 vfwmacc.vv 路径 21.49ms
 （6 倍）；端到端 prefill ~40 tok/s vs ~21 tok/s。
 
@@ -116,25 +116,23 @@ for k in range(0, K, BK):
 
 `smt.parallel` 设计意图是“带 sub-block 绑定的并行循环”。历史行为：
 
-- `bind_sub_block=True` 时，前端给循环打属性，编译器把它降级成
-  `scf.forall` → `spert.parallel`；
-- 这条链在当前 spine-opt 上**必崩**：`ConvertSpeStreamToLLVMPass` 的
-  ParallelRewriter 里延迟 RAUW 撞上 `UseDefLists.h:198 Assertion
-  'use_empty()'`（rc=134，pipeline 后段）。
+- `bind_sub_block=True` 时，前端给循环打属性，编译器把它降级成一条
+  特殊的并行 lowering 链；
+- 这条链在当前工具链上会**触发编译器断言崩溃**（rc=134、无 Python 栈，
+  basics/04 §4.5 的编译器后端形态）。
 
-所以**默认值已改为 `False`**：循环保持普通 `scf.for`（spine-opt 的常态
-输入，稳），代价是失去 sub-block 绑定语义。**写新 kernel 不要显式传
-True。**SPLIT_M/SPLIT_MN 分支在 False 下端到端验证通过（QEMU + K3 真机）。
+所以**默认值已改为 `False`**：循环保持普通顺序循环（编译器最稳的常态
+输入），代价是失去 sub-block 绑定语义。**写新 kernel 不要显式传
+True。**SPLIT_M/SPLIT_MN 分支在 False 下已在 K3 真机端到端验证通过。
 
-（顺带一个前端知识点：`bind_sub_block=True` 的属性注入依赖 spec overlay 的
-code_generator；删 overlay 时这段 plumbing 必须移植进主 code_generator，
-否则 `smt.parallel` 会在 tracing 期报 “Only range and static_range
-iterators are currently supported”。当前树已修。）
+（顺带一个排错签名：如果 `smt.parallel` 在 tracing 期报 “Only range and
+static_range iterators are currently supported”，说明你的 wheel 版本较旧、
+前端还不认识 smt.parallel——升级 wheel 即可。）
 
 ## 6.7 SPLIT_M / SPLIT_MN / SPLIT_K：GEMM tile 的三种切法
 
-（完整可跑来源：`python/examples/test_smt_mm.py`，三分支 512³ f16 均
-端到端验证——QEMU RPC 与 K3 真机都过。）
+（完整可跑来源：`python/examples/test_smt_mm.py`，三分支 512³ f16 均在
+K3 真机端到端验证通过。）
 
 一个 BLOCK_M×BLOCK_N 的 output tile，内部还要按 MICRO tile（16/8/32）切。
 三种编排的区别在于**沿哪个维度切 sub-block、B 矩阵怎么中转**：
@@ -159,22 +157,19 @@ SPLIT_K：K 维切
 
 `smt.mbarrier/alloc/barrier_arrive/barrier_wait` 会编译出对
 `spine_mbarrier_{alloc,release,arrive,wait}` 四个符号的引用。麻烦在于：
-**官方 libspert 根本没有 mbarrier 实现**（barrier 类 API 只有融合
-arrive+wait 的不透明句柄，表达不了分离协议）。各形态现状：
-
-- **QEMU RPC**：由 rpc-runtime 里的 Event 适配层提供（基于 libspert 0.6.3
-  公开 Event 接口：`event_create/event_signal/ctx_event_wait`，协程感知
-  阻塞不空转；事件池 64 槽，耗尽降级 spin）。
-- **板端 native**：需要部署含 mbarrier 符号的 runtime 构建。
+**运行时库不保证提供 mbarrier 实现**——部分版本的运行时没有这四个符号，
+kernel 编译全通、`.so` 正常生成，加载时才报 `load kernel failed` /
+`undefined symbol`。
 
 实践建议：**新 kernel 不依赖 mbarrier**。`bind_sub_block=False` 下
-`smt.parallel` 就是顺序 `scf.for`，同一 program 内 TCM 的 store→load 按
-程序序执行，天然不需要同步——`test_smt_mm.py` 删净 mbarrier 后三分支数值
-仍全对（`nm -D --undefined-only kernel.so` 零 `spine_mbarrier_*` 引用）。
+`smt.parallel` 就是顺序循环，同一 program 内 TCM 的 store→load 按程序序
+执行，天然不需要同步——`test_smt_mm.py` 删净 mbarrier 后三分支数值仍
+全对（`nm -D --undefined-only kernel.so` 可验证零 `spine_mbarrier_*`
+引用）。
 
-排错签名：kernel 在 host 编译全通、`.so` 正常生成，但 server 报
-`load kernel failed` → `nm -D --undefined-only kernel.so` 看到
-`spine_mbarrier_*` 未定义 = 你的 runtime 没这四个符号。
+排错签名：编译全通但加载失败 → `nm -D --undefined-only kernel.so` 看到
+`spine_mbarrier_*` 未定义 = 你环境里的运行时没有这四个符号（basics/04
+§4.5 的“运行时加载层”行）。
 
 ## 6.9 什么时候需要手写 smt？
 
@@ -198,7 +193,7 @@ nm -D --undefined-only <cache里的 kernel.so>
 
 ## 6.10 动手练习
 
-1. 跑 `python3 python/examples/test_smt_mm.py`（RPC 形态）。第一次编译较慢，
+1. 在 K3 上跑 `python3 python/examples/test_smt_mm.py`。第一次编译较慢，
    之后缓存命中。
 2. 在 SPLIT_M 分支里把 `smt.view(smt.dot(...), ..., (1,1))` 的 unpack 去掉
    （直接 `acc += smt.dot(a, b)`），观察数值错成什么样——亲眼见一次

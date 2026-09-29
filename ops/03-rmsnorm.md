@@ -140,10 +140,10 @@ fused_add_rmsnorm 的改法：两趟里都先做 `x = tl.load(X+cols) + tl.load(
 - block-ptr 变体 store 要显式 `.to(...)`；
 - constexpr 整数没有 `.to()`。
 
-平台侧已知问题：大 hidden_size 的 rms_norm/fused_add_rms_norm 曾出现在
-“TCM 溢出 / 负 vl OOB”家族失败名单（spine-mlir 侧已修，commit b86dd23）。
-遇到全零/垃圾输出，先确认 spine-opt 二进制代际与 libspert ≥0.6.3，
-再怀疑 kernel（basics/04 §4.5 分层）。
+旧版 wheel 已知问题：大 hidden_size 的 rms_norm/fused_add_rms_norm 曾出现
+在“scratch 内存溢出 / 越界读”家族失败名单（新版已修复）。遇到全零/垃圾
+输出，先升级 wheel 并换新 cache 重测（basics/04 §4.2），再怀疑 kernel
+（basics/04 §4.5 分层）。
 
 ## 3.5 spine_raw 版本：L0 标量算术链
 
@@ -206,8 +206,8 @@ golden（无 torch 内置时的手写参照，3.3 里已用）：
 y_ref = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps) * w.float()
 ```
 
-fp16 rtol/atol 1e-2。引用历史批次数字先核对 runtime 版本（0.6.0 grid
-假象家族，basics/04 §4.7）。
+fp16 rtol/atol 1e-2。引用历史批次数字先核对 wheel 版本（旧版运行时
+grid 丢弃假象家族，basics/04 §4.7）。
 
 ## 3.8 练习
 

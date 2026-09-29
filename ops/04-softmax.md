@@ -128,8 +128,8 @@ python softmax.py
   “归约前填单位元”规则，softmax 一趟里有两个归约、单位元不同：
   - `tl.max`：单位元是 **-inf**（任何真实值都比它大）；
   - `tl.sum(exp(...))`：需要 `exp(填充值) = 0`，即填充值 = **-inf**。
-  一个 -inf 同时满足两者。若填 0：max 在“全负行”上会错取 0，exp(0)=1
-  还会给分母凭空加 1——两处都错。
+    一个 -inf 同时满足两者。若填 0：max 在“全负行”上会错取 0，exp(0)=1
+    还会给分母凭空加 1——两处都错。
 - **`.to(tl.float32)` 不是可选优化，是硬性要求**：`tl.exp` 只收
   fp32/fp64，f16 直接 `ValueError`（4.5 坑 1）。f32 输入时这行是无害
   no-op，写上让同一 kernel 两种 dtype 通吃。
@@ -138,11 +138,11 @@ python softmax.py
 - **输出 cast**：普通指针 store 其实会隐式 cast，这里显式
   `.to(output_ptr.dtype.element_ty)` 是为了和 block-ptr 版行为一致、
   意图明确。
-- **grid=(1823,)**：每行一个 program。行数超 512 时旧 libspert（<0.6.3）
-  会静默丢弃（basics/04 §4.5），0.6.3+ 无碍。
+- **grid=(1823,)**：每行一个 program。旧版 wheel 对超大 grid 有上限，
+  超限会静默丢弃（basics/04 §4.5）；新版 wheel 的运行时自动分块，无碍。
 - `num_warps` 参数（仓库示例里有）是 GPU 概念，CPU 后端忽略即可。
 
-## 4.4 multi-tile 路径的形状（读懂即可）
+## 4.4 multi-tile 路径的形状
 
 行长超过单 block 容量（或 BLOCK 想控制在小值）时：
 
@@ -188,37 +188,14 @@ attention 里的 online softmax（flash 风格，max/sum 单趟在线更新）�
      别走这条路。
 2. **归约 dtype**：`tl.max/tl.sum` 对 fp16 输入返回 fp16，长行累加超容差。
    ONE_TILE 路径全程 f32（4.3 的写法）或 multi-tile 的 f32 累加器。
-3. **旧二进制的行宽边界问题**（已在 spine-mlir `c63415b`/`d04296f` 代际
-   修复）：行长非 vscale 整倍数时的 scalable 转换、in_bounds 误推断 +
-   poison init 垃圾 lane——症状如“BLOCK=16 的 int32 sum 恒差 -16”、f32
-   NaN。碰到先在**现役二进制**上复测，再怀疑 kernel。
+3. **旧版编译器的行宽边界问题**（新版已修复）：行长不是向量宽度整倍数
+   时，向量化的边界推断出错、把越界的垃圾 lane 读进结果——症状如
+   “BLOCK=16 的 int32 sum 恒差 -16”、f32 NaN。碰到先升级 wheel、换新
+   cache 复测，再怀疑 kernel。
 4. **改了 heuristic/语言层 Python 后必须换 TRITON_CACHE_DIR**——cache key
    不含 language 模块改动，旧 .so 会掩盖你的修改（basics/04 §4.2）。
 
-## 4.6 spine_raw 版本与两盆冷水
-
-默认 path 有 `tle.vexp`（无 dtype 检查的向量 exp），可以做向量级
-softmax：`python/tests/raw/test_raw_softmax.py`、`test_raw_log_softmax.py`。
-组织方式：grid=(1,)、外层循环串行遍历行、每行三趟（max/sum/scale），
-tail 用空 range loop（basics/05 §5.4）。历史上 2-pass softmax 曾是
-loop-env 泄露 dominance 崩溃的触发器（已修，basics/05 坑 4）。
-
-但实测结论要泼冷水：
-
-- **decode 场景小 K 的 fused softmax 跑不过 `torch.softmax`**——K=33~52
-  时慢 1.4x。原因：default path 无 program_id 没并行、tiny data 下 per-op
-  开销 >> 计算、torch.softmax 是优化过的 C++ op。decode softmax 22% 的
-  开销是 **Python dispatch**（f32 intermediate + 类型转换 + tensor alloc），
-  kernel fusion 消不掉 dispatch 本身。
-- **fuse QKT+softmax+AV 成单 kernel 已被实测否决**：Python
-  softmax+mask+scale 仅占 prefill 墙钟 ~0.8%（0.9ms/layer × 28 层 =
-  25.4ms），收益 << 实现成本（LLVM-direct 没有 exp，要多项式近似）。
-  详见 ops/08。
-
-**教训：融合决策要先 profile。**“理论上省访存”不等于“实测更快”，
-tiny shape + dispatch 主导的场景尤其如此。
-
-## 4.7 验证
+## 4.6 验证
 
 ```bash
 python softmax.py
@@ -230,7 +207,7 @@ golden：`torch.softmax(x.float(), dim=-1)`；fp16 结果 atol/rtol 1e-3~1e-2
 （概率值都在 [0,1]，atol 可以收紧）。极端值测试：加一组 `x` 含 ±100 大
 logits 的用例，确认无 nan/inf（验证减 max 真的生效）。
 
-## 4.8 练习
+## 4.7 练习
 
 1. 跑通 4.3。然后把 `other=-float('inf')` 改成 `other=0.`，用**全负数行**
    （如 `x = -torch.rand(64, 100) - 5`）重跑——预测输出哪里错、为什么，
@@ -240,8 +217,7 @@ logits 的用例，确认无 nan/inf（验证减 max 真的生效）。
 3. 实现 multi-tile 版（4.4 骨架补全），用 `BLOCK_N=256` 跑 n_cols=1000，
    与 ONE_TILE 版结果对齐（atol 1e-6，同为 f32 时应几乎逐位一致）。
 4. 因果 mask 热身（为 ops/08 做准备）：`n_cols=64` 的下三角 mask——
-   `tl.load` 后加 `x = tl.where(col_offsets[None,:] <= row_offsets[:,None],
-   x, -inf)` 再走三趟。golden：
+   `tl.load` 后加 `x = tl.where(col_offsets[None,:] <= row_offsets[:,None], x, -inf)` 再走三趟。golden：
    `torch.softmax(x.masked_fill(~mask, -inf), -1)`。
 
 下一篇：[05-gemv.md](05-gemv.md) —— LLM decode 的命脉。

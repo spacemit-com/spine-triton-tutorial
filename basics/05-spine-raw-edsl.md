@@ -27,7 +27,7 @@
    ▼
 linalg/memref/vector MLIR 文本（raw_linalg）
    │  经 tle.dsl_region 挂进主 kernel（见 5.6），
-   │  spine-opt 的 InlinePass 在 bufferization 前展开
+   │  编译器后端在降级早期把它原地展开
    ▼
 之后与标准 kernel 完全同一条流水线（basics/01 §1.4 的 ③④⑤）
 ```
@@ -60,7 +60,7 @@ thread-local registry 上，两个实例不共享，**记录会静默丢失**（
 **① `tle.mem(dtype)` — 内存参数。**raw kernel 的 tensor 参数用
 `X: tle.mem(f16)` 标注，语义是一块连续内存（memref）。`out=True` 标只写
 参数（帮助优化）。标量尺寸参数用 `N: tle.index`（MLIR 的 index 类型）。
-类型对不上时（比如主 kernel 传 i32 而 raw 期望 index）InlinePass 会自动插
+类型对不上时（比如主 kernel 传 i32 而 raw 期望 index）编译器会自动插
 `arith.index_cast`，一般不用你操心。
 
 **② `tle.vconfig(vl, ...)` — 一次处理多少个元素。**K3 的向量寄存器
@@ -188,17 +188,17 @@ if __name__ == "__main__":
    call() → emit 一个 tle.dsl_region op
             （raw_linalg 属性里内嵌 raw kernel 翻译出的完整 linalg 文本）
    ▼
-spine-triton-opt 的 C++ DSLRegionOpPattern
-   parse raw_linalg → 建 spine_ext.raw_region op
-   （operand 沿 ptr.to_ptr/memref.reinterpret_cast 链回溯到真实 memref）
+中层转换工具（wheel 自带的 spine-triton-opt）
+   parse raw_linalg → 建一个专用的 raw_region op
+   （operand 沿指针 cast 链回溯到真实的 memref）
    ▼
-spine-opt 的 SpineRawRegionInlinePass
-   在 bufferization 之前把 raw_region 原地展开进主函数
+编译器后端
+   在降级早期把 raw_region 原地展开进主函数
 ```
 
 所以 raw kernel 里的错误（非法类型、不支持的语句）会在**三个不同阶段**
-报出来：tracing 期（Python 异常）、DSLRegionOpPattern（parse 失败）、
-InlinePass（类型不匹配）。看到报错先判断在哪一站，再对症处理。
+报出来：tracing 期（Python 异常）、中层转换（parse 失败）、后端内联
+（类型不匹配）。看到报错先判断在哪一站，再对症处理。
 
 ## 5.7 API 地图
 
@@ -241,8 +241,8 @@ InlinePass（类型不匹配）。看到报错先判断在哪一站，再对症�
 | 适合     | 单 program 串行、需要 exp/log 的融合 kernel                                       | 需要并行度的 attention/GEMV 类 kernel                                  |
 
 **经验法则：能用默认路径就用（有 vexp、好写）；只有确实需要 program 级
-并行度时才上 LLVM-direct。**ops/08 的 attention kernel 是 LLVM-direct 的
-完整实战（per-head grid）。
+并行度时才上 LLVM-direct。**ops/08 §8.6 的案例研究展示了当年用 LLVM-direct
+拆 per-head attention kernel 的完整实战与收益边界。
 
 ## 5.8 坑清单（每一条都真实炸过）
 
@@ -259,10 +259,10 @@ InlinePass（类型不匹配）。看到报错先判断在哪一站，再对症�
    旧部署副本上见到此错，先同步两份副本（5.3）。
 5. **raw kernel 里 emit `vector_ext` 系 op 必须用 generic form**：
    写 `"vector_ext.batch_macc"(%lhs, %rhs, %acc) : (...) -> ...` 这种
-   引号形式，不能用真 assembly 语法——raw_linalg 文本要先经过
-   spine-triton-opt（它**没注册** vector_ext dialect）parse，真语法直接
-   parse 失败；generic form 任何工具都能过，最后由 spine-opt（注册了）
-   正常 lower。
+   引号形式，不能用真 assembly 语法——raw_linalg 文本要先经过中层转换
+   工具 parse，而它**不认识** vector_ext dialect，真语法直接 parse 失败；
+   generic form 任何工具都能过，最后由认识该 dialect 的编译器后端正常
+   lower。
 6. **LLVM-direct 的负数常量必须传字符串**：`tle.llvm_const("-1.0e38", "f32")`。
    写 `-1.0e38` 会被 Python AST 解析成 UnaryOp（负号是运算），codegen 报
    `'UnaryOp' object has no attribute 'value'`。
@@ -300,7 +300,7 @@ GEMV 的中间步骤），编译后期经 mixed bridge（用 MLIR Python binding
 
 - 向量级算子范例库：`python/tests/raw/test_raw_{softmax,silu,cumsum,argmax,group_norm,...}.py`
 - 矩阵引擎范例：`test_raw_mv_cbm.py`、`test_raw_mm_cbm.py`（配合 ops/05-gemv.md）
-- LLVM-direct attention 实战：ops/08-attention.md
+- LLVM-direct attention 案例研究：ops/08 §8.6
 - 全套 raw 测试基线：267 用例 261P/1F/1xF/4err（4 个 error 是诊断脚本的
   pytest 签名问题，跑套件时要 `--ignore`）
 

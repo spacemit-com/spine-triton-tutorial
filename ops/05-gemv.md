@@ -125,8 +125,9 @@ python gemv.py
   算好，真正的坑是 K=BLOCK_K 恰好整块时特化路径曾把参数折成 constexpr
   导致下游拿不到 `.handle` 报错（raw 版 host 的同款问题）。显式关掉特化，
   一个二进制通吃所有 shape。
-- **grid = cdiv(1024, 32) = 32 个 program**，安全范围（basics/04 的 512
-  限制在 0.6.3+ 已解除，但 grid 大小与性能的关系见 5.4——反直觉）。
+- **grid = cdiv(1024, 32) = 32 个 program**，安全范围（旧版 wheel 对超大
+  grid 有上限，basics/04 §4.5；新版运行时自动分块。grid 大小与性能的
+  关系见 5.4——反直觉）。
 - **store 隐式 cast**：`row_sum` 是 f32，普通指针 store 自动降到 y 的
   f16（对照 block-ptr 的严格检查，ops/02 §2.6 坑 3）。
 
@@ -231,14 +232,14 @@ def _mv_sv_host(B, A, C, K, N, BLOCK: tl.constexpr):
   “更多 program 更并行”的 GPU 直觉失效。生产选 NB=256。
 - **kernel 内再切 4×64 sub-tile**：NB=256 的块内用 4 个独立
   `vector<1×64>` acc，每 K-block 做 4 次 pack + batch_macc。64 = f16 一个
-  scalable 寄存器宽（macc 零吞吐损失）；32 是 sub-vscale 会 crash；每块
-  buf 4KB << L1 32KB。
+  scalable 寄存器宽（macc 零吞吐损失）；32 不足一个寄存器宽、会触发
+  编译器崩溃；每块 buf 4KB << L1 32KB。
 - **A^T pack 用硬件 `spestruct.pack`**（对标 mm 的 pack 例程），取代软件
   linalg.generic 循环。旧软件 pack 在大 M 下是灾难（M=512 只有 mainline
-  的 0.35x），硬件 pack 救回 1.17x（~3.3x 加速）。它的两个布局坑写进
-  CLAUDE.md 规则 52/53：`inner_tiles=[8, NB]` 不能写反（写反越过 K 边界
-  读 NaN）；单 tile ≤512 元素（整块 [32×64]=2048 触发
-  SplitLargeShapeScalable assert crash，必须切 K/8 个 tile）。
+  的 0.35x），硬件 pack 救回 1.17x（~3.3x 加速）。它的两个布局坑（都
+  真实炸过）：`inner_tiles=[8, NB]` 不能写反（写反会越过 K 边界读出
+  NaN）；单 tile ≤512 元素（更大的整块会触发编译器断言崩溃，必须切成
+  K/8 个小 tile）。
 - **动态 M**：kernel 内 `for kb in tle.range(nk)`（nk=M/32）K 块循环，
   列 stride 支持动态 SSA。约束：`M%32==0 && N%256==0 && f16 &&
   contiguous`。
@@ -255,10 +256,10 @@ def _mv_sv_host(B, A, C, K, N, BLOCK: tl.constexpr):
 | f16 结果随 K 增大误差滚大、个别 shape 1F | acc 用了 f16（port 版历史 bug） | 5.2 精讲第 2 条；对照 mainline diff |
 | 不同 shape 各编译一份 / K 整除 shape 报 `.handle` | int 参数被值特化 | `do_not_specialize` |
 | 尾部行结果对但堆损坏 / 后续 kernel 崩 | phantom 行越界写（N%BLOCK≠0） | C 分配到 Np 吸收（5.4 第 4 条） |
-| raw kernel 报 unregistered dialect `vector_ext` | 用了 assembly 语法（spine-triton-opt 未注册该 dialect，parse 失败） | generic form 字符串（basics/05 坑 5） |
-| 矩阵引擎版 NaN | spestruct.pack `inner_tiles` 写反 | CLAUDE.md 规则 52；tile ≤512 元素 |
+| raw kernel 报 unregistered dialect `vector_ext` | 用了 assembly 语法（中层转换工具不认识该 dialect，parse 失败） | generic form 字符串（basics/05 坑 5） |
+| 矩阵引擎版 NaN | pack 的 `inner_tiles` 写反 | 5.5 的两个布局坑；tile ≤512 元素 |
 | M=160 类 shape 失败但 M=128 过 | 超出验证范围 + port acc dtype bug 叠加 | 先修 acc dtype，再扩验证矩阵 |
-| 输出全零 / 垃圾 | grid>512 丢弃（libspert <0.6.3）或负 vl OOB（旧 spine-mlir） | basics/04 §4.5 分层排查 |
+| 输出全零 / 垃圾 | 旧版 wheel 丢弃超大 grid，或旧版编译器越界读（新版均已修） | 升级 wheel + 新 cache；basics/04 §4.5 分层排查 |
 
 ## 5.7 验证
 
@@ -270,8 +271,8 @@ python3 python/tests/raw/perf_mv.py                            # 性能对照
 ```
 
 golden：`torch.mv(W.float(), x.float())`；f16 rtol/atol 1e-2。IR 层自查
-（dump 后）：e2e 输出无 `from/to_scalable` 残留、llc 产物含 `riscv.vle/vse`
-（basics/04 §4.4）。
+（dump 后）：后端输出 IR 无 `from/to_scalable` 残留、指令层产物（.ll）含
+`riscv.vle/vse`（basics/04 §4.4）。
 
 > 跑 raw 测试套件的整体注意事项（bindings PYTHONPATH、4 个诊断脚本要
 > --ignore、独立 cache）见 basics/05 §5.11。
@@ -279,8 +280,8 @@ golden：`torch.mv(W.float(), x.float())`；f16 rtol/atol 1e-2。IR 层自查
 ## 5.8 练习
 
 1. 跑通 5.2。把 `BLOCK_N` 从 32 改到 4 和 128，N=4096 下观察 grid 变化与
-   结果正确性；想想 5.5 的“dispatch 开销主导”预言哪种更快（有真板/QEMU
-   就实测）。
+   结果正确性；想想 5.5 的“dispatch 开销主导”预言哪种更快（在 K3 上
+   实测）。
 2. 把 acc 的 dtype 改成 `W.dtype.element_ty`（f16），K 取 1024 重跑——
    复现 port 历史 bug 的误差签名（对照 5.2 精讲第 2 条）。改回来。
 3. 跑 `test_raw_mv_svector.py`，然后数一数 style2 kernel 里 `tle.vload(A,...)`

@@ -196,9 +196,9 @@ python gemm.py
   cast，但 **block-ptr store 是严格类型检查**——f32 值存进 f16 block 直接报
   “Block element type(fp16) and value element type(fp32) mismatch”。这是
   新手在 block_ptr 上的第一大坑。
-- **grid 大小**：256/32 × 256/32 = 8×8 = 64 个 program。回忆 basics/04：
-  libspert <0.6.3 时 grid>512 会被静默丢弃，64 很安全；生产 kernel 的
-  BLOCK 调小让 grid 超 512 时就要小心（0.6.3+ 无此问题）。
+- **grid 大小**：256/32 × 256/32 = 8×8 = 64 个 program。旧版 wheel 对超大
+  grid 有上限，超限会被静默丢弃（basics/04 §4.5），64 很安全；新版 wheel
+  的运行时会自动分块，生产 kernel 把 BLOCK 调小让 grid 变大也无妨。
 
 ### K 大时：K-loop 版
 
@@ -276,9 +276,9 @@ f32 累加。这不只是数值建议，而是曾经真实违反过的契约：�
 | TCM scratch | 256KB/worker | 大 tile 中间量 spill 超量 → NULL → 段错误 |
 | BN 上限 | output tile ≤ 32×256（8192 元素）安全；16384 元素崩 | segfault（tl.dot 与 smt.dot 同限，共享 mmt4d lowering） |
 | BK | K 大必须分块 | BK=K 一次展开需 608KB → 溢出 hang |
-| grid | ≤512（libspert <0.6.3）；0.6.3+ 引擎自动分块 | 旧 runtime 静默丢弃 → 输出=未初始化内存；更坑：丢弃 config 计时~0 反而**赢得 autotune** |
+| grid | 旧版 wheel 有上限（512 量级）；新版运行时自动分块 | 旧版超限静默丢弃 → 输出=未初始化内存；更坑：丢弃 config 计时~0 反而**赢得 autotune** |
 | N 特别大 | N > 131072（lm_head）不走 smt.dot | 单 launch grid 爆；chunked 2 launches 的 dispatch 开销反超（237ms vs 180ms 实测）→ 用 vfwmacc.vv 路径 |
-| dtype | f16/f32 可用；**bf16 撞 MatmulConfigAnalysis UNREACHABLE** | rc=134（平台豁免项，非你的错） |
+| dtype | f16/f32 可用；**bf16 的 matmul 通路当前不可用** | rc=134 编译器崩溃（平台限制，非你的错） |
 
 ## 1.8 层次 3：smt 矩阵引擎显式编排（性能形态）
 
@@ -330,13 +330,13 @@ full-N 输出的前 n_main 列），tail 走 native `torch.addmm` 再 copy。
 | 症状 | 根因 | 动作 |
 |---|---|---|
 | `Block element type ... mismatch` | block-ptr store 没显式 `.to()` | 1.5 精讲第 4 条 |
-| 输出全零 / 99.9% 垃圾值 | grid>512 被旧 libspert 丢弃；或旧 spine-mlir 的 f32 unpack 写丢弃 bug（b86dd23 已修） | 查 libspert 版本；换 cache 重跑；再查二进制代际 |
-| K∈(64,96) 区间数据依赖错值 | 负 vl 无符号钳位 → 全宽 OOB 读（b86dd23 已修） | 同上，先确认二进制代际 |
+| 输出全零 / 99.9% 垃圾值 | 旧版 wheel 丢弃超大 grid；或旧版编译器的结果写丢弃 bug（新版已修） | 升级 wheel + 换新 cache 重跑（basics/04 §4.2/§4.7） |
+| 特定 K 区间的数据依赖错值 | 旧版编译器在特定尺寸区间的越界读 bug（新版已修） | 同上；仍复现按 §4.4 报告并附上精确触发区间 |
 | f16 结果 diff ~175（大得离谱） | smt.dot packed 结果没 unpack 就累加 | `smt.view(..., (1,1))` |
 | f16 结果 diff 小但 ~12% 元素超差 | f16 截断累加（1.7 契约） | 查哪里把部分和降回 f16 |
 | `KeyError: MICRO_M` | config pre_hook 给无 MICRO_* 参数的 kernel 注入（调用方绕过 port 直接 import 了 general kernel） | 查调用方 import 路径 |
-| 换机器/换二进制后“修复失效” | TRITON_CACHE_DIR 没换，旧 .so 复用 | basics/04 §4.2 |
-| rc=134 无 Python 栈 | spine-opt 层崩溃（bf16 matmul、TCM、pack 断言…） | basics/04 §4.4 离线复现 |
+| 升级 wheel 后“修复不生效” | TRITON_CACHE_DIR 没换，旧 .so 复用 | basics/04 §4.2 |
+| rc=134 无 Python 栈 | 编译器后端崩溃（bf16 matmul、TCM 溢出等） | basics/04 §4.4 流程 |
 
 ## 1.10 练习
 
