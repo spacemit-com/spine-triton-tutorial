@@ -1,63 +1,79 @@
-# spine-triton Tutorial
+# spine-triton 教程（零基础版）
 
-面向 SpacemiT K3（RISC-V + RVV + 矩阵引擎）的 Triton 编译器 **spine-triton** 入门教程。
+这是一套**面向完全新手**的 spine-triton 教程。
 
-spine-triton 让你用熟悉的 `@triton.jit` Python DSL 写 kernel，编译到 RISC-V
-可执行代码（RVV scalable vector / K3 vfwmacc 矩阵单元），在 K3 板卡上原生运行，
-或在 x86 主机上通过 QEMU RPC 远程执行。
+spine-triton 是 SpacemiT（进迭时空）的 Triton 编译器后端：它让你用 Python 写
+高性能算子（kernel），编译成 RISC-V 机器码，跑在 K3 芯片上。默认玩法很直接：
+在 K3 板卡上 `pip install` 官方 wheel，然后像写 PyTorch 一样写 kernel。
+（进阶篇会讲怎么在 x86 开发机上交叉编译出板上可用的 wheel。）
+
+## 你需要的基础
+
+- 会 Python，用过 PyTorch（知道 `torch.Tensor`、`torch.randn`、shape/dtype 是什么）。
+- **不需要**会 Triton、CUDA、MLIR、RISC-V、汇编——这些都会在教程里从零讲。
+- 一块 SpacemiT K3 板卡（riscv64 Linux，Python 3.12）。进阶的交叉编译流程另需一台 x86 Linux 开发机。
+
+## 怎么使用这套教程
+
+1. **按顺序读 Part 1**（basics/，共 6 章）。每章末尾的“动手”环节一定要真的跑一遍，
+   跑通了再往下走。
+2. Part 2 的算子章节（ops/）可以按需挑读，但建议至少读完 01（GEMM）、
+   04（Softmax）、06（Reduction）——它们是理解其余算子的基础。
+3. 所有代码块都是**完整可运行**的（除非明确标注为“片段”）。遇到报错，
+   先查当章的“常见错误”一节，再查 [basics/04](basics/04-running-and-debugging.md)
+   的排错手册。
+4. 进阶章节（basics/05、basics/06）第一遍读不懂是正常的，标记一下跳过，
+   做完 ops 前几章再回来。
 
 ## 目录
 
 ### Part 1 — 基础（Skills）
 
-| 文件 | 内容 |
-|---|---|
-| [basics/01-introduction.md](basics/01-introduction.md) | spine-triton 是什么：架构、编译流水线、三层语言接口、相关仓库 |
-| [basics/02-installation.md](basics/02-installation.md) | 安装：预编译 wheel、x86/RPC 源码构建、riscv64 交叉编译、FlagTree wheel |
-| [basics/03-quickstart.md](basics/03-quickstart.md) | 第一个 kernel：vec add、CPUDriver、grid 语义、dtype 约束 |
-| [basics/04-running-and-debugging.md](basics/04-running-and-debugging.md) | 运行形态（native / QEMU RPC）、环境变量、IR dump、缓存管理、常见坑 |
-| [basics/05-spine-raw-edsl.md](basics/05-spine-raw-edsl.md) | spine_raw eDSL：向量级原语直接产 linalg/vector MLIR，LLVM-direct 模式 |
-| [basics/06-smt-matrix-engine.md](basics/06-smt-matrix-engine.md) | smt 扩展：K3 矩阵引擎（vfwmadot/vfwmacc）、TCM、MICRO tile、alloc/view |
+| 章 | 文件 | 你将学会 |
+|---|---|---|
+| 1 | [basics/01-introduction.md](basics/01-introduction.md) | kernel 是什么、为什么需要 Triton、spine-triton 把 Python 变成机器码的完整路径、K3 芯片 60 秒速览 |
+| 2 | [basics/02-installation.md](basics/02-installation.md) | 在 K3 上 pip 安装、验证与排错；（进阶）在 x86 上交叉编译 wheel 再装到板上 |
+| 3 | [basics/03-quickstart.md](basics/03-quickstart.md) | 写出并跑通第一个 kernel（向量加法），逐行理解 grid/program/block/mask，完成 4 个练习 |
+| 4 | [basics/04-running-and-debugging.md](basics/04-running-and-debugging.md) | kernel 运行时到底发生了什么：编译缓存、IR dump、环境变量、报错定位三板斧 |
+| 5 | [basics/05-spine-raw-edsl.md](basics/05-spine-raw-edsl.md) | （进阶）spine_raw eDSL：用向量级原语直接控制 RVV，绕过标准路径的限制 |
+| 6 | [basics/06-smt-matrix-engine.md](basics/06-smt-matrix-engine.md) | （进阶）smt 扩展：K3 矩阵引擎、MICRO tile、TCM，GEMM 性能形态的底层机制 |
 
 ### Part 2 — 算子实战（按重要性排序）
 
-| # | 算子 | 文件 | 核心内容 |
+| # | 算子 | 文件 | 一句话简介 |
 |---|---|---|---|
-| 1 | GEMM (mm) | [ops/01-gemm.md](ops/01-gemm.md) | tl.dot → block_ptr → smt 矩阵引擎三层写法、MICRO tile、tail 处理 |
-| 2 | LayerNorm | [ops/02-layernorm.md](ops/02-layernorm.md) | fused fwd kernel、f32 累加约定、spine_raw 三趟版 |
-| 3 | RMSNorm | [ops/03-rmsnorm.md](ops/03-rmsnorm.md) | reduce → rsqrt → 广播模式、fused add+rmsnorm |
-| 4 | Softmax | [ops/04-softmax.md](ops/04-softmax.md) | row-parallel、数值稳定三趟、fp16 的 tl.exp dtype 坑 |
-| 5 | GEMV (mv) | [ops/05-gemv.md](ops/05-gemv.md) | M=1 的 vfwmacc.vf 转置映射、B 零搬运、动态 M K-block 循环 |
-| 6 | Reduction | [ops/06-reduction.md](ops/06-reduction.md) | sum/mean/max/argmax 通用模式、行长与 vscale、精度容差 |
-| 7 | Elementwise & Fusion | [ops/07-elementwise-fused.md](ops/07-elementwise-fused.md) | pointwise 家族、silu/gelu、libdevice shim、constexpr 解包坑 |
-| 8 | Attention | [ops/08-attention.md](ops/08-attention.md) | GQA QKT+AV kernel、per-head grid、D=128 分 chunk、SDPA 注册路径 |
-| 9 | Cumsum / Scan | [ops/09-cumsum-scan.md](ops/09-cumsum-scan.md) | Hillis-Steele scan、协程栈需求、整型 dtype 已知限制 |
-| 10 | Quantization | [ops/10-quantization.md](ops/10-quantization.md) | per-token-group-quant-fp8、bf16 向量限制、dtype 判读方法 |
+| 1 | GEMM（矩阵乘） | [ops/01-gemm.md](ops/01-gemm.md) | 一切深度学习计算的核心；三个层次的写法：tl.dot → block_ptr → 矩阵引擎 |
+| 2 | LayerNorm | [ops/02-layernorm.md](ops/02-layernorm.md) | “归约 + 逐元素”复合算子的代表；f32 累加军规的主战场 |
+| 3 | RMSNorm | [ops/03-rmsnorm.md](ops/03-rmsnorm.md) | LayerNorm 的简化版，LLM 主流；reduce → rsqrt → 广播模式 |
+| 4 | Softmax | [ops/04-softmax.md](ops/04-softmax.md) | 数值稳定性入门必修；K3 上 fp16 + tl.exp 的第一大坑 |
+| 5 | GEMV（矩阵×向量） | [ops/05-gemv.md](ops/05-gemv.md) | LLM decode 的命脉；vfwmacc 转置映射的完整案例研究 |
+| 6 | Reduction（归约） | [ops/06-reduction.md](ops/06-reduction.md) | sum/mean/max/argmax 通用模式；行长与 vscale 的边界行为 |
+| 7 | Elementwise 与融合 | [ops/07-elementwise-fused.md](ops/07-elementwise-fused.md) | add/silu/gelu；math 函数链路、libdevice、epilogue 融合 |
+| 8 | Attention | [ops/08-attention.md](ops/08-attention.md) | QK^T + softmax + AV；GQA per-head kernel、性能收益的边界在哪 |
+| 9 | Cumsum / Scan | [ops/09-cumsum-scan.md](ops/09-cumsum-scan.md) | 前缀和/前缀扫描；scan 类算子的组织方式与平台边界行为 |
+| 10 | Cat / 数据搬运 | [ops/10-cat.md](ops/10-cat.md) | concat/stack 家族；纯访存算子的组织方式与指针分支坑 |
 
-## 学习路线建议
+> 注：量化类算子（fp8/int8 quant）当前工具链尚未支持，本教程暂不包含。
 
-1. **只跑标准 Triton kernel**：读 01–04，然后从 `ops/01-gemm.md` 开始。
-   标准 `tl.*` 写法在 spine-triton 上与 GPU Triton 基本一致，重点看每章的
-   “K3 关键点 / 已知坑”一节。
-2. **要压榨矩阵引擎性能**（mm / mv / attention）：加读 basics/06，然后
-   ops/01、05、08。
-3. **要写向量级定制 kernel**（fuse、超越函数、特殊布局）：加读 basics/05，
-   然后 ops/02、04、06 里的 spine_raw 版本。
+## 代码参照仓库
 
-## 代码参照
-
-教程里的代码全部取材自真实仓库，正文会标注来源路径：
+教程代码取材自真实仓库，正文会标注来源路径：
 
 - `spine-triton/python/examples/` — 可运行示例（mm_block_ptr.py、test_smt_mm.py、test_layernorm.py、test_softmax.py…）
-- `spine-triton/python/tests/` — 单测（test_blas_ops.py、test_norm_ops.py、test_reduction_ops.py…）
+- `spine-triton/python/tests/` — 单元测试（test_blas_ops.py、test_norm_ops.py、test_reduction_ops.py…）
 - `spine-triton/python/tests/raw/` — spine_raw eDSL 测试（test_raw_layernorm.py、test_raw_mv_svector.py…）
-- `FlagGems`（spacemit 后端 `_spacemit/ops/`）— 生产级算子注册实现（mm.py、softmax.py、layernorm.py、flash_attention.py…）
+- `FlagGems`（`_spacemit/ops/`）— 生产级 K3 优化算子（mm.py、softmax.py、layernorm.py、flash_attention.py…）
 
-## 约定
+## 全局约定
 
-- “K3” 指 SpacemiT K3（arch id `0xA064`/A100，vlen=1024，f16 MICRO tile M/K/N = 16/8/32）。
-- 所有 kernel 默认 f16 输入 / f32 累加，这是数值正确性的第一约定。
-- 文中 `spine-opt`、`llc` 等工具来自 spine-mlir 发行包，随 spine-triton 安装部署。
+- **“K3”**：SpacemiT K3 芯片（arch id `0xA064`，向量寄存器 vlen=1024 bit，
+  f16 下一个向量寄存器装 64 个元素，矩阵引擎 f16 MICRO tile = M/K/N 16/8/32）。
+- **dtype 军规**：f16 输入、f32 累加、输出前才 cast 回 f16。全书通用，不再重复解释。
+- **运行环境**：Python 代码默认在 K3 板卡上直接运行（basics/02 装好环境即可），
+  除程序开头的 driver 激活两行外，**不需要设置任何环境变量**。
+- 编译器后端工具与运行时库随 wheel 一起安装在
+  `triton/backends/spine_triton/{bin,lib}/` 下，平时不需要手动调用；排查编译
+  问题时用 `SPINE_TRITON_DUMP_PATH` 把中间产物落盘查看（basics/04）。
 
 ## License
 
