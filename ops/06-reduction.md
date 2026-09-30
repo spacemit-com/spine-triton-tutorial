@@ -164,10 +164,11 @@ def sum_1d_kernel(X: tle.mem(f16), out: tle.mem(f32, out=True), N: tle.index):
     tle.sstore(out, 0, tle.vreduce_sum(acc))     # 水平归约 → 标量 store
 ```
 
-行归约版（`sum_2d_dim1_kernel`）把 `row_idx` 作为 host 传入的
-`tl.program_id(0)`，load 偏移变成 `row_idx * N + i`，store 到
-`out[row_idx]`；host 里还有 `if row_idx < M:` 守卫（tl 层的标量 if 是
-允许的，default path 的“无 if”限制在 raw kernel 内部）。
+行归约版（`sum_2d_dim1_kernel`）就是 basics/05 §5.5 的"host pid 传参"
+并行形态：`row_idx` 是 host tl kernel 的 `tl.program_id(0)`，load 偏移
+变成 `row_idx * N + i`，store 到 `out[row_idx]`，launch `[(M,)]` 每行
+一个 program；host 里还有 `if row_idx < M:` 守卫（tl 层的标量 if 是
+允许的，default path 的"无 if"限制在 raw kernel 内部）。
 
 对照 tl 版：结构完全同型（主/尾循环 = 分块循环、`vreduce_sum` =
 `tl.sum(axis=0)`、`sstore` 标量 = store 单值），只是 raw 层把 strip-mine

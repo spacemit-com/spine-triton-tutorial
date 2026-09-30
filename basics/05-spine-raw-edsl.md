@@ -150,7 +150,7 @@ if __name__ == "__main__":
     N = 256
     X = torch.randn(N, dtype=torch.float16)
     out = torch.zeros(N, dtype=torch.float32)
-    layernorm_1d_host[(1,)](X, out, N)          # grid=(1,)：默认路径没有 program_id
+    layernorm_1d_host[(1,)](X, out, N)          # grid=(1,)：整个 1D 向量本就是一个 program 的活
 
     ref = torch.nn.functional.layer_norm(X.float(), (N,), eps=EPS)
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
@@ -171,9 +171,53 @@ if __name__ == "__main__":
   （对应 RVV 的 vredsum 指令族）。注意三趟里累加都是**向量级**的
   （lane 各加各的），只有最后一步才水平归约——这是向量归约的标准形态。
 - **`(vc - mean) * scale`**：`mean`/`scale` 是标量，与向量运算时自动广播。
-- **`grid=(1,)`**：默认路径没有 `program_id`，一个 kernel 只能一个 program
-  串行跑完。要按行/按头并行，要么在外层 Python 循环多次 launch，要么用
-  LLVM-direct 路径（5.7）。
+- **`grid=(1,)`**：这里 grid=(1,) 是**任务性质的选择，不是 raw 的上限**
+  ——整条 1D 向量的 layernorm 本来就是一个 program 的活。raw kernel 内部
+  确实没有 `program_id`，但多 program 并行完全做得到：见下面的并行形态。
+
+### grid=(1,) 不是上限：并行形态（host pid 传参，重要必读）
+
+`_sr_call` 的 inputs 里可以放**在 host `@triton.jit` kernel 里算出来的
+标量**（5.6 会讲这正是它的设计意图）——`tl.program_id(0)` 就是这样的值。
+于是默认路径的标准并行形态是：
+
+> **host tl kernel 持有真正的 grid，把 `tl.program_id(0)`（或由它算出的
+> 分段范围）当普通标量参数传给 raw kernel；raw kernel 只处理自己拿到的
+> 那一段。** 并行语义全部在 tl 层表达，raw 层保持"无 program_id、无 if"。
+
+真实测试 `test_raw_group_norm.py`（按行做 layernorm，每行一个 program）：
+
+```python
+@tle.raw_kernel
+def group_norm_kernel(X: tle.mem(f16), out: tle.mem(f32, out=True),
+                      G: tle.index, C: tle.index, row: tle.index):
+    ...                          # 三趟扫第 row 行：偏移全是 row * C + i
+
+@triton.jit
+def group_norm_host(X, out, G, C):
+    row = tl.program_id(0)       # ← 并行度在这一层
+    if row < G:                  # tl 层的标量 if 是合法的（raw 层才没有 if）
+        _sr_call(group_norm_kernel, outputs=[], inputs=[X, out, G, C, row])
+
+group_norm_host[(G,)](X, out, G, C)      # grid=(G,)：每行一个 program
+```
+
+三个要点：
+
+- raw kernel 不知道也不需要知道自己是第几号 program——它只收到一个
+  `row`。上面 5.5 例子里 grid=(1,) 之所以成立，是因为那个任务本来只有
+  一份工作。
+- 边界守卫（`if row < G:`）写在 host tl kernel 里；grid 大小的注意项与
+  普通 tl kernel 完全一样（basics/04 §4.5）。
+- 这个模式在全书反复出现：ops/05 §5.4 的 GEMV（pid → row_base/row_end，
+  每 program 算 BLOCK 行）、ops/06 §6.4 的行归约（row_idx）、ops/09 §9.4
+  的三阶段并行 cumsum（Phase1/3 的 host 都是 `p = tl.program_id(0)` +
+  `if p < P:` + 把 p 传进 raw）。**以后见到 grid=(1,) 的 raw 例子先想：
+  是这个任务天然串行（整段 scan、全量归约），还是作者没写 host grid。**
+
+只有在 raw kernel **内部**直接要 `program_id`（不想经过 tl host）时才需要
+LLVM-direct 路径（5.7）——host pid 传参形态对绝大多数场景已经够用，而且
+保留默认路径的全套向量原语（vexp/vlog/rsqrt…）。
 
 ## 5.6 `call()` 是怎么把 raw kernel 挂进主 kernel 的
 
@@ -235,13 +279,14 @@ if __name__ == "__main__":
 |          | 默认 linalg 路径                                                                  | LLVM-direct 路径                                                       |
 | -------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | 产出     | `vector.transfer_read/write` + `math.fma`（可被自动转成 RVV scalable vector） | LLVM dialect 直发（`llvm.fadd/load/store`、`llvm.riscv.*`）        |
-| 并行     | **无 `program_id`** → grid=(1,) 串行                                     | **有 `program_id`** → per-head/per-row 并行                   |
+| 并行     | kernel 内无 `program_id`；**host tl kernel 的 pid 经 `_sr_call` 传标量** → 任意 grid（5.5 并行形态） | kernel 内**有 `program_id`** → 直接 per-head/per-row 并行      |
 | 超越函数 | 有`vexp/vlog/sqrt/rsqrt`                                                        | **没有**（LLVM 23 移除了 math intrinsic；要 exp 只能多项式近似） |
-| 控制流   | 无 if；tail 用空 range 循环                                                       | `llvm.fcmp` + select 手工拼                                          |
-| 适合     | 单 program 串行、需要 exp/log 的融合 kernel                                       | 需要并行度的 attention/GEMV 类 kernel                                  |
+| 控制流   | 无 if；tail 用空 range 循环；边界守卫写在 host tl 层                             | `llvm.fcmp` + select 手工拼                                          |
+| 适合     | 绝大多数场景（host pid 传参即可并行）、需要 exp/log 的融合 kernel                | raw kernel 内部直接要 program_id 的 attention/GEMV 类               |
 
-**经验法则：能用默认路径就用（有 vexp、好写）；只有确实需要 program 级
-并行度时才上 LLVM-direct。**ops/08 §8.6 的案例研究展示了当年用 LLVM-direct
+**经验法则：能用默认路径就用（有 vexp、好写，并行靠 host pid 传参解决）；
+只有确实需要在 raw kernel 内部拿 program_id 时才上 LLVM-direct。**ops/08
+§8.6 的案例研究展示了当年用 LLVM-direct
 拆 per-head attention kernel 的完整实战与收益边界。
 
 ## 5.8 坑清单（每一条都真实炸过）
@@ -249,7 +294,10 @@ if __name__ == "__main__":
 1. **导入路径错**（5.3）：`call()` 记录静默丢失，kernel “编译成功”但 raw
    代码没进去。症状：数值完全不对但无任何报错。
 2. **默认路径用了 `program_id` / `if` / `icmp` / `select`**：不支持，
-   前端直接报 AttributeError 或未知节点。需要它们只能换 LLVM-direct。
+   前端直接报 AttributeError 或未知节点。**要并行度先换写法不换路径**：
+   host tl kernel 拿 `tl.program_id(0)` 传标量进 `_sr_call`（5.5 并行
+   形态）；边界守卫的 if 也写在 host tl 层。只有 raw kernel 内部非要
+   `program_id` 不可时才换 LLVM-direct。
 3. **`vconfig` 两种写法都对但语义有别**：裸语句 `tle.vconfig(N-i, 1)`
    只改 vl 不绑名字；赋值形式 `nvl = tle.vconfig(-1, 1)` 会把 `nvl` 绑成
    编译期常量（能参与 `Nfloor` 的整除计算）。

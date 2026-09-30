@@ -175,7 +175,9 @@ python cumsum.py
   n 很小时（如 <4096）单 program 串行 scan 反而可能更快——老规矩，
   实测说了算。
 
-## 9.4 spine_raw 版本：最透明的 scan
+## 9.4 spine_raw 版本：从串行最小形到三阶段并行
+
+### 串行最小形（语义演示）
 
 （来源：`python/tests/raw/test_raw_cumsum.py`——文件头注释原话："Unlike
 the reduce family, scan emits one output per position. The simplest correct
@@ -193,11 +195,159 @@ def cumsum_1d_kernel(X: tle.mem(f32), out: tle.mem(f32, out=True),
         tle.sstore(out, i, acc)           # 每个位置都 store
 ```
 
-这是 O(N) 纯串行的 scan——没有向量并行，但它是**语义上最直白的
-cumsum**：一个累加器、逐元素加、逐位置写。测试 N=16/64/100/257 全过
-（golden `torch.cumsum`，atol/rtol 1e-4）。`test_raw_cumsum_vec.py` 是
-向量化版（向量移位 + 前缀和的手工 Hillis-Steele），对照着读能看清
-"`tl.cumsum` 替你展开了什么"。
+O(N) 纯串行、grid=(1,) 单 program——但它是**语义上最直白的 cumsum**：
+一个累加器、逐元素加、逐位置写。测试 N=16/64/100/257 全过（golden
+`torch.cumsum`，atol/rtol 1e-4）。
+
+它用 grid=(1,) 是因为 **raw kernel 内部没有 `program_id`**——但这不等于
+"raw 只能串行"。标准解法是 basics/05 §5.5 的**host pid 传参**并行形态：
+host `@triton.jit` kernel 持有真正的 grid，把 `tl.program_id(0)` 当普通
+标量经 `_sr_call` 传进 raw kernel。scan 也能这样并行——把 N 切成块，
+块间用 9.2 的 scan-then-fan 组织。下面的三阶段版就是现成的真实测试。
+
+### 并行版：三阶段 block-scan（完整可运行）
+
+（来源：`python/tests/raw/test_raw_cumsum_vec.py`。把 N 切成 P = N/VL 块，
+VL=64：**Phase1** grid=(P,) 每 program 向量归约自己块的总和；**Phase2**
+grid=(1,) 对 P 个块和做排他前缀和；**Phase3** grid=(P,) 每 program 块内
+串行 scan 再加块基值。正是 9.2 两趟法 + "段2 前缀化"的 raw 实现。）
+
+```python
+# cumsum_raw_parallel.py — 三阶段 block-scan cumsum（host pid 传参并行）
+import torch
+import triton
+import triton.language as tl
+from triton.backends.spine_triton.driver import CPUDriver
+
+triton.runtime.driver.set_active(CPUDriver())
+
+import triton.language.extra.spine_raw as tle
+from triton.language.extra.spine_raw import call as _sr_call
+
+f32 = tle.f32
+VL = 64          # 块宽：必须与 kernel 内 vconfig(-1,1) 的实际返回一致
+
+
+# ── Phase 1: 每块求自己的总和（grid=(P,)，向量归约）──────────────
+@tle.raw_kernel
+def block_sum_kernel(X: tle.mem(f32), block_sums: tle.mem(f32, out=True),
+                     N: tle.index, p: tle.index):
+    nvl = tle.vconfig(-1, 1)
+    base = p * nvl                          # ← 我是第几块：host 传来的 p
+    vx = tle.vload(X, base)                 # 整块一次读进向量寄存器
+    tle.sstore(block_sums, p, tle.vreduce_sum(vx))
+
+
+@triton.jit
+def block_sum_host(X, block_sums, N, P):
+    p = tl.program_id(0)                    # ← 并行度在 tl 层
+    if p < P:                               # tl 层标量 if，合法
+        _sr_call(block_sum_kernel, outputs=[], inputs=[X, block_sums, N, p])
+
+
+# ── Phase 2: P 个块和的排他前缀和（grid=(1,)，合理的小串行）──────
+@tle.raw_kernel
+def prefix_offset_kernel(block_sums: tle.mem(f32),
+                         offsets: tle.mem(f32, out=True), P: tle.index):
+    tle.vconfig(-1, 1)
+    acc = tle.vreduce_sum(tle.vzero(f32))   # f32 标量 0.0（scan 种子）
+    for i in tle.range(0, P, 1):
+        tle.sstore(offsets, i, acc)         # 排他前缀：先写（不含自己）
+        acc = acc + tle.sload(block_sums, i, dtype=f32)   # 再加上自己
+
+
+@triton.jit
+def prefix_offset_host(block_sums, offsets, P):
+    _sr_call(prefix_offset_kernel, outputs=[], inputs=[block_sums, offsets, P])
+
+
+# ── Phase 3: 块内串行 scan + 加块基值（grid=(P,)）────────────────
+@tle.raw_kernel
+def apply_prefix_kernel(X: tle.mem(f32), out: tle.mem(f32, out=True),
+                        offsets: tle.mem(f32), N: tle.index, p: tle.index):
+    nvl = tle.vconfig(-1, 1)
+    base = p * nvl
+    offset = tle.sload(offsets, p, dtype=f32)   # 我前面所有块的总和
+    acc = tle.vreduce_sum(tle.vzero(f32))
+    for j in tle.range(0, nvl, 1):              # 块内 64 步串行 scan
+        xi = tle.sload(X, base + j, dtype=f32)
+        acc = acc + xi
+        tle.sstore(out, base + j, acc + offset)
+
+
+@triton.jit
+def apply_prefix_host(X, out, offsets, N, P):
+    p = tl.program_id(0)
+    if p < P:
+        _sr_call(apply_prefix_kernel, outputs=[], inputs=[X, out, offsets, N, p])
+
+
+def cumsum_vectorized(X: torch.Tensor) -> torch.Tensor:
+    N = X.numel()
+    P = N // VL
+    Nfloor = P * VL
+    out = torch.zeros(N, dtype=torch.float32)
+    if P > 0:
+        bs = torch.zeros(P, dtype=torch.float32)
+        offs = torch.zeros(P, dtype=torch.float32)
+        Xf = X[:Nfloor].contiguous().reshape(-1)
+        block_sum_host[(P,)](Xf, bs, Nfloor, P)      # Phase 1
+        prefix_offset_host[(1,)](bs, offs, P)        # Phase 2
+        apply_prefix_host[(P,)](Xf, out[:Nfloor], offs, Nfloor, P)  # Phase 3
+    if Nfloor < N:                       # 尾巴（<VL 个）：host 侧 torch 收尾
+        last = out[Nfloor - 1].item() if Nfloor > 0 else 0.0
+        out[Nfloor:] = torch.cumsum(X[Nfloor:].float(), dim=0) + last
+    return out
+
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    for N in [64, 512, 8192, 100, 513]:    # 前三个 VL 对齐，后两个带尾巴
+        X = torch.randn(N, dtype=torch.float32)
+        got, ref = cumsum_vectorized(X), torch.cumsum(X, dim=0)
+        torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
+        print(f"PASS N={N}")
+```
+
+```bash
+python cumsum_raw_parallel.py
+# PASS N=64 ... PASS N=513
+python3 -m pytest python/tests/raw/test_raw_cumsum_vec.py -q   # 原测试
+```
+
+### 逐段精讲
+
+- **host 三件套**：`p = tl.program_id(0)` + `if p < P:` +
+  `_sr_call(..., inputs=[..., p])`。raw kernel 不知道自己是第 p 个
+  program，它只收到一个标量 `p`——并行语义全在 tl 层，raw 层保持
+  "无 program_id、无 if"（basics/05 §5.5 并行形态；ops/06 §6.4 的行
+  归约、ops/05 §5.4 的 GEMV 同款）。
+- **提速在哪：关键路径**。串行版关键路径 = N 次加法；三阶段版 ≈
+  VL（Phase3 块内）+ P（Phase2）+ 两次额外 launch。N=8192 时
+  8192 步 → 64+128 步，且 Phase1 的块归约是向量化的（一条
+  `vreduce_sum` 收掉 64 个元素）。注意 Phase3 块内仍是 64 步串行
+  标量循环——scan 的块内串行无法消除，能消除的只有块间串行。
+- **Phase 2 的 grid=(1,) 是合理的**：P = N/64，N=8192 也才 128——
+  128 步串行前缀和远比再来一次并行 launch + 同步便宜（ops/06 §6.2
+  形态 B："段2 的输入小到怎么算都快"；9.2 生产实现的递归前缀化同理）。
+  循环体内**先 `sstore` 再累加**是排他前缀（exclusive）的关键：
+  `offsets[p]` 必须是"前面所有块的总和"，不含自己——写反顺序整个输出
+  平移一个块和（练习 3 会让你亲手验证）。
+- **与 9.3 的 tl 两趟法对照**：Phase1+2 = `scan_part_sum` 的"段总和"
+  加 partial_sum 前缀化，Phase3 = 块内 `tl.cumsum` + `add_base` 合一。
+  tl 版块内 scan 是原语一步到位，raw 版把 64 步显式写出来——又是
+  "raw 把编译器替你做的展开给你看"（ops/06 §6.4）。
+- **尾巴放 host 侧**：`N % VL != 0` 时剩不到 64 个元素，default path
+  没有 if 保护越界，host 直接 `torch.cumsum(tail) + last` 收尾最省事
+  （kernel 内做也可以——`vconfig` 收窄 + 尾循环，ops/05 §5.4 的写法；
+  这里选择不做，因为最多 63 个元素）。
+- **三阶段 = 三次 launch**：N 很小时 dispatch 开销可能超过并行收益
+  （9.3 精讲最后一条同款）——原测试的对齐用例从 N=64（P=1！退化成
+  串行 + 两次多余 launch）到 N=8192 全过，正确性与性能是两回事。
+
+对照读两个版本（串行 vs 三阶段），你能看清 scan 并行化的全部要素：
+分块、块归约、小块前缀、块内 scan + 基值——以及每一段该放 tl 层还是
+raw 层。
 
 ## 9.5 K3 关键点：三层边界
 
@@ -309,10 +459,12 @@ golden：`torch.cumsum`（dim 对齐）。三件事必须覆盖：
 2. 实现 `cummax`：把 `tl.cumsum` 换成 `tl.cummax`，两趟法的"段总和"
    换成什么？（提示：max 的结合律——段 base 是前缀 max，合并操作是
    `tl.maximum`。）golden `torch.cummax`。
-3. 跑 `test_raw_cumsum_vec.py` 并读源码：数一数手工 Hillis-Steele 做了
-   几轮移位（N=64 时），对照 log2(64)。再解释为什么 raw 串行版
-   （9.4）在 K3 上未必比向量版慢很多（提示：scan 是 memory-bound，
-   ops/05 §5.1 的算术强度分析）。
+3. 跑 `python3 -m pytest python/tests/raw/test_raw_cumsum_vec.py -q`，
+   对照 9.4 读源码并回答：(a) 把 Phase 2 的 `sstore` 挪到 `acc +
+   sload` 之后，输出会错成什么样？（inclusive vs exclusive 前缀——先
+   预测每块偏多少，再动手验证。）(b) N=8192 时算一算三阶段版的关键
+   路径步数和串行版的（9.4 精讲第 2 条），解释 Phase 3 块内仍是 64 步
+   串行、整体为什么还能快。
 4. 边界实验（在 K3 上，每换 shape 记得新 cache）：构造行长为 15、16、
    17 的二维 cumsum（`tl.cumsum(x_2d, axis=1)`，grid=(n_rows,)），
    记录哪些能过、哪些崩。若崩，按 §9.5 层 2 的判读写一段 30 字以内的

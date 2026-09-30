@@ -239,8 +239,9 @@ FlagGems 的 `_spacemit/ops/layernorm.py` 端口曾 24F/16P，修复后 40/40。
   API 限制。
 
 带 weight/bias、多行组织的 raw 版本参考 `test_raw_group_norm.py` /
-`test_raw_instance_norm.py` / `test_raw_batch_norm.py`（默认 path 无
-program_id，grid=(1,) + 外层串行循环遍历行）。
+`test_raw_instance_norm.py` / `test_raw_batch_norm.py`（并行形态：
+grid=(G,)，host tl kernel 把 `tl.program_id(0)` 当行号传给 raw kernel
+——basics/05 §5.5 的"host pid 传参"，raw 层本身无 program_id）。
 
 单 tile 优化：当 `N ≤ BLOCK_SIZE` 时三趟循环各只执行一次——数据整行留在
 寄存器里，访存从 5 趟（x 三读 + w/b 一读 + y 一写按块计）降到理论最小。
