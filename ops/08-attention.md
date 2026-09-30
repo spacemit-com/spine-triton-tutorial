@@ -5,8 +5,8 @@
 （ops/01）、按行 softmax（ops/04）、f16→f32 累加军规（basics/03）、
 GEMV 式的访存分析（ops/05）。这一章我们先手算一个 2×2 的 attention，
 再写一个完整可运行的单 tile fused causal kernel，然后读生产级
-flash-attention 的骨架，最后用一个真实案例讲清楚**"优化到什么程度值得
-停"**——这是全教程最重要的一课之一。
+flash-attention 的骨架，最后用一份 profile 账本讲清楚**"钱花在哪、
+优化到什么程度值得停"**——这是全教程最重要的一课之一。
 
 ## 8.1 这个算子在算什么：手算一遍
 
@@ -43,7 +43,7 @@ row1: [0, 1]     → softmax → [0.269, 0.731] → O[1] = 0.269·[10,20] + 0.73
 
 ## 8.2 为什么它是核心，钱都花在哪
 
-以 Qwen3-0.6B prefill 为例（proton host-region 计时实测，方法见 8.8）：
+以 Qwen3-0.6B prefill 为例（proton host-region 计时实测，方法见 8.7）：
 
 - attention scope 占 prefill 墙钟 **~33%**，其中 **~90% 是 q/k/v/o_proj
   四个矩阵乘**（那就是 ops/01 的 GEMM），真正的 QK^T/softmax/AV 只占
@@ -51,12 +51,16 @@ row1: [0, 1]     → softmax → [0.269, 0.731] → O[1] = 0.269·[10,20] + 0.73
 - attention 内部再拆：**AV=47%、QK^T=17%**，softmax/repeat_kv/
   transpose/mask 各 <2%。
 
-两个结论直接决定了工程优先级：
+这份账本给出三条普适结论，直接决定工程优先级：
 
-1. attention kernel 本体（QKT+AV）值得优化——它内部 AV 又占大头；
-2. 但别指望端到端大收益——proj mm 主导。想提升整体，先去做 mm
-   （ops/01 的 smt.dot 路径，1.91x）和 `logits_to_keep=1`（lm_head
-   206ms→14ms）。8.6 有完整的实测账本。
+1. **先 profile 再动手**：知道 AV=47%、QK^T=17%、softmax<2%，才知道
+   attention kernel 本体（QKT+AV）值得优化、softmax 不值得碰；
+2. **kernel 提速 ≠ 端到端提速**：attention 本体只占墙钟的一小部分，
+   占比 × kernel 提速倍数才是端到端收益上限（Amdahl 定律）。想提升
+   整体，先去做 mm（ops/01 的 smt.dot 路径，1.91x）和
+   `logits_to_keep=1`（lm_head 206ms→14ms）；
+3. **优化的正确顺序是占比从大到小**：mm（端到端 1.91x）→
+   lm_head（logits_to_keep，14.7x）→ attention kernel（本章）。
 
 ## 8.3 并行方案
 
@@ -247,61 +251,7 @@ out = acc / l_i                                  # 扫完才归一化，一次�
 报错）；backward 的部分形状在旧版编译器上有崩溃家族（rc=134 无 Python
 栈），处理流程同 basics/04 §4.4——新 cache、最小化、升级 wheel、报告。
 
-## 8.6 案例研究：拆开的 QKT/AV kernel 与"收益边界"
-
-生产 fused kernel 之外，历史上有过另一条路线：**不做 fused，把 QK^T 和
-AV 写成两个独立的 spine_raw（LLVM-direct）kernel，中间 softmax 留在
-Python**。这条路线的价值在于它是"vfwmacc 向量通路手写 attention"的
-完整案例，也产出了全教程最重要的实测账本。
-
-两个 kernel 同一套模式（LLVM-direct 层，basics/05 §5.7）：
-
-```
-grid = (Hq,)                        # 每 program 一个 Q head
-hq = tle.program_id(0)
-hk = hq // Nrep                     # GQA：整数除法，跳过 repeat_kv 物化
-```
-
-- **QKT kernel**（`O[Hq,Mq,Mk] = Q[Hq,Mq,D]·K[Hkv,Mk,D]^T`，每个输出
-  元素是长度 D 的点积）：D=128 需 **2×64-chunk**——把 Q 的两个 64 元素
-  chunk（qv0/qv1）hoist 出 n 循环，每 (m,n) 各 load K 的两个 chunk，
-  2 次 vfwmacc.vv + 2 次向量水平归约链式累加成 dot。**必须分离 Mq/Mk**
-  （decode 时 Mq=1、Mk 随 KV cache 增长，混用一个参数会直接错）。
-  f16 输入 → f32 acc（vfwmacc 是 widening 乘加）→ 截断回 f16。
-  实测：prefill max_diff=7.8e-3、decode 2.4e-4；**kernel 1.1ms vs
-  原生 15.4ms**。
-- **AV kernel**（`O[Hq,M,N] = A[Hq,M,K]·V[Hkv,K,N]`）：A 的行做标量
-  广播（vfwmacc.vf——GEMV 同款指令，ops/05 §5.3），V 走向量通路；
-  N=128 同样 2×64-chunk（两个独立 acc）。实测 **max_diff=0（逐位
-  精确）**；kernel 0.81ms vs 原生 15.4ms。
-
-kernel 级 ~8x 提速。但端到端呢？
-
-| 接入路径 | prefill | decode |
-|---|---|---|
-| eager attention + 替换 QKT/AV | 9.79 tok/s（1.18x） | 2.15（1.01x） |
-| SDPA 接口层替换（保持默认 SDPA） | 9.63（1.16x） | 2.25（1.06x） |
-
-**kernel 8x，端到端只有 1.01~1.18x。** 为什么？回到 8.2 的账本：
-attn scope 里 ~90% 是 q/k/v/o_proj 四个 mm，attention kernel 本体只动
-剩下 10% 里的一部分；Amdahl 定律冷酷生效。
-
-**fusion 也被实测否决**：把 QKT+softmax+AV 融成一个 kernel"理论上省
-中间张量的访存"，但 profile 显示 Python softmax+mask+scale 只有
-~0.9ms/层 × 28 层 ≈ 25.4ms，**占 prefill 墙钟 0.8%**——融合的收益上限
-就这么大，而实现成本（LLVM-direct 层没有现成 exp，要手写多项式近似）
-极高。不做。
-
-这一节的三条普适教训：
-
-1. **先 profile 再动手**：知道 AV=47%/QKT=17%/softmax<2%，才知道该写
-   哪两个 kernel、不该碰 softmax；
-2. **kernel 提速 ≠ 端到端提速**：算清楚你的 kernel 占墙钟百分之几，
-   乘以提速倍数就是收益上限；
-3. **优化的正确顺序是占比从大到小**：mm（smt.dot，端到端 1.91x）→
-   lm_head（logits_to_keep，14.7x）→ attention kernel（本章）。
-
-## 8.7 K3 关键点与坑
+## 8.6 K3 关键点与坑
 
 1. **D 从 config.json 读，不要猜**。Qwen3-0.6B 的 head_dim=128 是
    config.json 显式指定的，**不是** hidden_size/num_heads（那样算出来
@@ -327,7 +277,7 @@ attn scope 里 ~90% 是 q/k/v/o_proj 四个 mm，attention kernel 本体只动
    dtype 表——"dtype1 全挂"多半就是第 6 条的平台限制，不是你的 kernel
    （先读测试文件的 parametrize 再归因，basics/04 §4.7）。
 
-## 8.8 profile 方法：钱花在哪一段
+## 8.7 profile 方法：钱花在哪一段
 
 K3 的 wheel 自带 proton 计时（basics/04 §4.3），两个用法：
 
@@ -347,7 +297,7 @@ B==1 && GQA && contiguous && 无 attn_mask && dropout==0，不满足则
 fallback 到 manual 分解——fallback 故意不调 aten SDPA，避免算子替换
 语境下的递归）。
 
-## 8.9 验证
+## 8.8 验证
 
 ```bash
 python attention.py                        # 本章单 tile kernel
@@ -362,26 +312,27 @@ golden 三选一：
 
 必测形态：causal / 非 causal；prefill（Mq=Mk 大）/ decode（Mq=1, Mk 大）
 ——Mq/Mk 分离的回归点；GQA（Hq≠Hkv）；M、D 非 2 幂（mask 路径）。
-f16 容差 1e-2 起步；AV 这类"权重×值"的段单独测可以要求逐位精确
-（8.6 的 max_diff=0 说明做得到）。
+f16 容差 1e-2 起步；AV 这类"权重×值"、数值范围良态的段单独测时，
+甚至可以要求逐位精确。
 
-## 8.10 练习
+## 8.9 练习
 
 1. 跑通 8.4。把 causal mask 那两行注释掉，验证输出变成非因果
    attention（golden 同步去掉 masked_fill），确认 max diff 仍然很小。
 2. 把 8.1 的手算例子写成单元测试：M=2, D=2，Q/K/V 用 8.1 的字面值，
    期望输出 `[[10,20],[24.62,34.62]]`（atol 1e-2）。这是你第一个
    "人肉可验证"的 attention 测试。
-3. 把 M 提到 256（BLOCK_M=BLOCK_N=256），跑之前先按 8.7 第 2 条心算
+3. 把 M 提到 256（BLOCK_M=BLOCK_N=256），跑之前先按 8.6 第 2 条心算
    TCM 预算，预测会不会崩，再验证。若崩了，把 BLOCK_N 降到 64 并按
    8.5 的骨架加 K/V 分块循环（不需要 online softmax——非 causal 且
    max 可以先全行扫一遍，两趟法）。
 4. 实现 GQA：K/V 的 head 数改成 Hq//2，kernel 里
    `off_hkv = pid_q // 2`（提示：base 的算法对 K/V 要用 Hkv）。golden
    用 `F.scaled_dot_product_attention(..., enable_gqa=True)`。
-5. 思考题：8.6 的账本里，若把 proj mm 也换成 smt.dot 路径（ops/01，
-   ~1.9x），attention kernel 保持 8x，端到端 prefill 大约能到多少？
-   用 Amdahl 公式算，再对照 ops/01 的实测 ~40 tok/s 验证你的模型。
+5. 思考题：8.2 的账本里，若把 proj mm 也换成 smt.dot 路径（ops/01，
+   ~1.9x），同时假设 attention kernel 本体（QKT+AV）提速 8x，端到端
+   prefill 大约能到多少？用 Amdahl 公式算，再对照 ops/01 的实测
+   ~40 tok/s 验证你的模型。
 
 下一篇：[09-cumsum-scan.md](09-cumsum-scan.md) —— 前缀和与 scan，
 编译链上坑密度最高的算子族。

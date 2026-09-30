@@ -276,18 +276,16 @@ LLVM-direct 路径（5.7）——host pid 传参形态对绝大多数场景已�
 
 两条路径怎么选：
 
-|          | 默认 linalg 路径                                                                  | LLVM-direct 路径                                                       |
-| -------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| 产出     | `vector.transfer_read/write` + `math.fma`（可被自动转成 RVV scalable vector） | LLVM dialect 直发（`llvm.fadd/load/store`、`llvm.riscv.*`）        |
-| 并行     | kernel 内无 `program_id`；**host tl kernel 的 pid 经 `_sr_call` 传标量** → 任意 grid（5.5 并行形态） | kernel 内**有 `program_id`** → 直接 per-head/per-row 并行      |
-| 超越函数 | 有`vexp/vlog/sqrt/rsqrt`                                                        | **没有**（LLVM 23 移除了 math intrinsic；要 exp 只能多项式近似） |
-| 控制流   | 无 if；tail 用空 range 循环；边界守卫写在 host tl 层                             | `llvm.fcmp` + select 手工拼                                          |
-| 适合     | 绝大多数场景（host pid 传参即可并行）、需要 exp/log 的融合 kernel                | raw kernel 内部直接要 program_id 的 attention/GEMV 类               |
+|          | 默认 linalg 路径                                                                                               | LLVM-direct 路径                                                       |
+| -------- | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| 产出     | `vector.transfer_read/write` + `math.fma`（可被自动转成 RVV scalable vector）                              | LLVM dialect 直发（`llvm.fadd/load/store`、`llvm.riscv.*`）        |
+| 并行     | kernel 内无`program_id`；**host tl kernel 的 pid 经 `_sr_call` 传标量** → 任意 grid（5.5 并行形态） | kernel 内**有 `program_id`** → 直接 per-head/per-row 并行     |
+| 超越函数 | 有`vexp/vlog/sqrt/rsqrt`                                                                                     | **没有**（LLVM 23 移除了 math intrinsic；要 exp 只能多项式近似） |
+| 控制流   | 无 if；tail 用空 range 循环；边界守卫写在 host tl 层                                                           | `llvm.fcmp` + select 手工拼                                          |
+| 适合     | 绝大多数场景（host pid 传参即可并行）、需要 exp/log 的融合 kernel                                              | raw kernel 内部直接要 program_id 的 attention/GEMV 类                  |
 
 **经验法则：能用默认路径就用（有 vexp、好写，并行靠 host pid 传参解决）；
-只有确实需要在 raw kernel 内部拿 program_id 时才上 LLVM-direct。**ops/08
-§8.6 的案例研究展示了当年用 LLVM-direct
-拆 per-head attention kernel 的完整实战与收益边界。
+只有确实需要在 raw kernel 内部拿 program_id 时才上 LLVM-direct。**
 
 ## 5.8 坑清单（每一条都真实炸过）
 
@@ -323,7 +321,7 @@ LLVM-direct 路径（5.7）——host pid 传参形态对绝大多数场景已�
 9. **测试函数的 host 函数名要唯一**：`call()` 的 AST path 按函数名触发，
    同名函数会互相干扰。
 
-## 5.9 mixed 模式（知道有这东西即可）
+## 5.9 mixed 模式
 
 一个 raw kernel 可以携带 sibling LLVM 函数（host 侧辅助例程，比如三段式
 GEMV 的中间步骤），编译后期经 mixed bridge（用 MLIR Python bindings 做的
@@ -348,7 +346,6 @@ GEMV 的中间步骤），编译后期经 mixed bridge（用 MLIR Python binding
 
 - 向量级算子范例库：`python/tests/raw/test_raw_{softmax,silu,cumsum,argmax,group_norm,...}.py`
 - 矩阵引擎范例：`test_raw_mv_cbm.py`、`test_raw_mm_cbm.py`（配合 ops/05-gemv.md）
-- LLVM-direct attention 案例研究：ops/08 §8.6
 - 全套 raw 测试基线：267 用例 261P/1F/1xF/4err（4 个 error 是诊断脚本的
   pytest 签名问题，跑套件时要 `--ignore`）
 
